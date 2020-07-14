@@ -13,6 +13,7 @@ import type {LazyComponent as LazyComponentType} from 'react/src/ReactLazy';
 import type {Fiber} from './ReactInternalTypes';
 import type {FiberRoot} from './ReactInternalTypes';
 import type {Lanes, Lane} from './ReactFiberLane';
+import type {MutableSource} from 'shared/ReactTypes';
 import type {
   SuspenseState,
   SuspenseListRenderState,
@@ -62,6 +63,7 @@ import {
   Update,
   Ref,
   Deletion,
+  ForceUpdateForLegacySuspense,
 } from './ReactSideEffectTags';
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
@@ -80,12 +82,7 @@ import invariant from 'shared/invariant';
 import shallowEqual from 'shared/shallowEqual';
 import getComponentName from 'shared/getComponentName';
 import ReactStrictModeWarnings from './ReactStrictModeWarnings.new';
-import {
-  REACT_ELEMENT_TYPE,
-  REACT_LAZY_TYPE,
-  REACT_LEGACY_HIDDEN_TYPE,
-  getIteratorFn,
-} from 'shared/ReactSymbols';
+import {REACT_LAZY_TYPE, getIteratorFn} from 'shared/ReactSymbols';
 import {
   getCurrentFiberOwnerNameInDevOrNull,
   setIsRendering,
@@ -128,10 +125,10 @@ import {
 } from './ReactTypeOfMode';
 import {
   shouldSetTextContent,
-  shouldDeprioritizeSubtree,
   isSuspenseInstancePending,
   isSuspenseInstanceFallback,
   registerSuspenseInstanceRetry,
+  supportsHydration,
 } from './ReactFiberHostConfig';
 import type {SuspenseInstance} from './ReactFiberHostConfig';
 import {shouldSuspend} from './ReactFiberReconciler';
@@ -198,8 +195,12 @@ import {
   markSkippedUpdateLanes,
   getWorkInProgressRoot,
   pushRenderLanes,
+  getExecutionContext,
+  RetryAfterError,
+  NoContext,
 } from './ReactFiberWorkLoop.new';
 import {unstable_wrap as Schedule_tracing_wrap} from 'scheduler/tracing';
+import {setWorkInProgressVersion} from './ReactMutableSource.new';
 
 import {disableLogs, reenableLogs} from 'shared/ConsolePatchingDev';
 
@@ -548,6 +549,13 @@ function updateSimpleMemoComponent(
           workInProgress,
           renderLanes,
         );
+      } else if (
+        (current.effectTag & ForceUpdateForLegacySuspense) !==
+        NoEffect
+      ) {
+        // This is a special case that only exists for legacy mode.
+        // See https://github.com/facebook/react/pull/19216.
+        didReceiveUpdate = true;
       }
     }
   }
@@ -571,8 +579,19 @@ function updateOffscreenComponent(
   const prevState: OffscreenState | null =
     current !== null ? current.memoizedState : null;
 
-  if (nextProps.mode === 'hidden') {
-    if (!includesSomeLane(renderLanes, (OffscreenLane: Lane))) {
+  if (
+    nextProps.mode === 'hidden' ||
+    nextProps.mode === 'unstable-defer-without-hiding'
+  ) {
+    if ((workInProgress.mode & ConcurrentMode) === NoMode) {
+      // In legacy sync mode, don't defer the subtree. Render it now.
+      // TODO: Figure out what we should do in Blocking mode.
+      const nextState: OffscreenState = {
+        baseLanes: NoLanes,
+      };
+      workInProgress.memoizedState = nextState;
+      pushRenderLanes(workInProgress, renderLanes);
+    } else if (!includesSomeLane(renderLanes, (OffscreenLane: Lane))) {
       let nextBaseLanes;
       if (prevState !== null) {
         const prevBaseLanes = prevState.baseLanes;
@@ -1062,6 +1081,20 @@ function updateHostRoot(current, workInProgress, renderLanes) {
     // be any children to hydrate which is effectively the same thing as
     // not hydrating.
 
+    if (supportsHydration) {
+      const mutableSourceEagerHydrationData =
+        root.mutableSourceEagerHydrationData;
+      if (mutableSourceEagerHydrationData != null) {
+        for (let i = 0; i < mutableSourceEagerHydrationData.length; i += 2) {
+          const mutableSource = ((mutableSourceEagerHydrationData[
+            i
+          ]: any): MutableSource<any>);
+          const version = mutableSourceEagerHydrationData[i + 1];
+          setWorkInProgressVersion(mutableSource, version);
+        }
+      }
+    }
+
     const child = mountChildFibers(
       workInProgress,
       null,
@@ -1121,26 +1154,6 @@ function updateHostComponent(
   }
 
   markRef(current, workInProgress);
-
-  if (
-    (workInProgress.mode & ConcurrentMode) !== NoMode &&
-    nextProps.hasOwnProperty('hidden')
-  ) {
-    const wrappedChildren = {
-      $$typeof: REACT_ELEMENT_TYPE,
-      type: REACT_LEGACY_HIDDEN_TYPE,
-      key: null,
-      ref: null,
-      props: {
-        children: nextChildren,
-        // Check the host config to see if the children are offscreen/hidden.
-        mode: shouldDeprioritizeSubtree(type, nextProps) ? 'hidden' : 'visible',
-      },
-      _owner: __DEV__ ? {} : null,
-    };
-    nextChildren = wrappedChildren;
-  }
-
   reconcileChildren(current, workInProgress, nextChildren, renderLanes);
   return workInProgress.child;
 }
@@ -2077,9 +2090,18 @@ function updateSuspenseFallbackChildren(
   };
 
   let primaryChildFragment;
-  if ((mode & BlockingMode) === NoMode) {
+  if (
     // In legacy mode, we commit the primary tree as if it successfully
     // completed, even though it's in an inconsistent state.
+    (mode & BlockingMode) === NoMode &&
+    // Make sure we're on the second pass, i.e. the primary child fragment was
+    // already cloned. In legacy mode, the only case where this isn't true is
+    // when DevTools forces us to display a fallback; we skip the first render
+    // pass entirely and go straight to rendering the fallback. (In Concurrent
+    // Mode, SuspenseList can also trigger this scenario, but this is a legacy-
+    // only codepath.)
+    workInProgress.child !== currentPrimaryChildFragment
+  ) {
     const progressedPrimaryFragment: Fiber = (workInProgress.child: any);
     primaryChildFragment = progressedPrimaryFragment;
     primaryChildFragment.childLanes = NoLanes;
@@ -2263,6 +2285,14 @@ function updateDehydratedSuspenseComponent(
   // We should never be hydrating at this point because it is the first pass,
   // but after we've already committed once.
   warnIfHydrating();
+
+  if ((getExecutionContext() & RetryAfterError) !== NoContext) {
+    return retrySuspenseComponentWithoutHydrating(
+      current,
+      workInProgress,
+      renderLanes,
+    );
+  }
 
   if ((workInProgress.mode & BlockingMode) === NoMode) {
     return retrySuspenseComponentWithoutHydrating(
@@ -2782,6 +2812,8 @@ function updatePortalComponent(
   return workInProgress.child;
 }
 
+let hasWarnedAboutUsingNoValuePropOnContextProvider = false;
+
 function updateContextProvider(
   current: Fiber | null,
   workInProgress: Fiber,
@@ -2796,6 +2828,14 @@ function updateContextProvider(
   const newValue = newProps.value;
 
   if (__DEV__) {
+    if (!('value' in newProps)) {
+      if (!hasWarnedAboutUsingNoValuePropOnContextProvider) {
+        hasWarnedAboutUsingNoValuePropOnContextProvider = true;
+        console.error(
+          'The `value` prop is required for the `<Context.Provider>`. Did you misspell it or forget to pass it?',
+        );
+      }
+    }
     const providerPropTypes = workInProgress.type.propTypes;
 
     if (providerPropTypes) {
@@ -2928,7 +2968,7 @@ function bailoutOnAlreadyFinishedWork(
 ): Fiber | null {
   if (current !== null) {
     // Reuse previous dependencies
-    workInProgress.dependencies_new = current.dependencies_new;
+    workInProgress.dependencies = current.dependencies;
   }
 
   if (enableProfilerTimer) {
@@ -3231,11 +3271,17 @@ function beginWork(
       }
       return bailoutOnAlreadyFinishedWork(current, workInProgress, renderLanes);
     } else {
-      // An update was scheduled on this fiber, but there are no new props
-      // nor legacy context. Set this to false. If an update queue or context
-      // consumer produces a changed value, it will set this to true. Otherwise,
-      // the component will assume the children have not changed and bail out.
-      didReceiveUpdate = false;
+      if ((current.effectTag & ForceUpdateForLegacySuspense) !== NoEffect) {
+        // This is a special case that only exists for legacy mode.
+        // See https://github.com/facebook/react/pull/19216.
+        didReceiveUpdate = true;
+      } else {
+        // An update was scheduled on this fiber, but there are no new props
+        // nor legacy context. Set this to false. If an update queue or context
+        // consumer produces a changed value, it will set this to true. Otherwise,
+        // the component will assume the children have not changed and bail out.
+        didReceiveUpdate = false;
+      }
     }
   } else {
     didReceiveUpdate = false;

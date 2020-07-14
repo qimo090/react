@@ -7,7 +7,7 @@
  * @flow
  */
 
-import type {TopLevelType} from 'legacy-events/TopLevelEventTypes';
+import type {TopLevelType} from '../events/TopLevelEventTypes';
 import type {Fiber, FiberRoot} from 'react-reconciler/src/ReactInternalTypes';
 import type {
   BoundingRect,
@@ -75,12 +75,12 @@ import {
   enableSuspenseServerRenderer,
   enableDeprecatedFlareAPI,
   enableFundamentalAPI,
-  enableModernEventSystem,
+  enableCreateEventHandleAPI,
   enableScopeAPI,
 } from 'shared/ReactFeatureFlags';
 import {HostComponent, HostText} from 'react-reconciler/src/ReactWorkTags';
 import {TOP_BEFORE_BLUR, TOP_AFTER_BLUR} from '../events/DOMTopLevelEventTypes';
-import {listenToEvent} from '../events/DOMModernPluginEventSystem';
+import {listenToReactEvent} from '../events/DOMModernPluginEventSystem';
 
 export type Type = string;
 export type Props = {
@@ -233,7 +233,7 @@ export function prepareForCommit(containerInfo: Container): Object | null {
   eventsEnabled = ReactBrowserEventEmitterIsEnabled();
   selectionInformation = getSelectionInformation();
   let activeInstance = null;
-  if (enableDeprecatedFlareAPI) {
+  if (enableDeprecatedFlareAPI || enableCreateEventHandleAPI) {
     const focusedElem = selectionInformation.focusedElem;
     if (focusedElem !== null) {
       activeInstance = getClosestInstanceFromNode(focusedElem);
@@ -244,7 +244,7 @@ export function prepareForCommit(containerInfo: Container): Object | null {
 }
 
 export function beforeActiveInstanceBlur(): void {
-  if (enableDeprecatedFlareAPI) {
+  if (enableDeprecatedFlareAPI || enableCreateEventHandleAPI) {
     ReactBrowserEventEmitterSetEnabled(true);
     dispatchBeforeDetachedBlur((selectionInformation: any).focusedElem);
     ReactBrowserEventEmitterSetEnabled(false);
@@ -252,7 +252,7 @@ export function beforeActiveInstanceBlur(): void {
 }
 
 export function afterActiveInstanceBlur(): void {
-  if (enableDeprecatedFlareAPI) {
+  if (enableDeprecatedFlareAPI || enableCreateEventHandleAPI) {
     ReactBrowserEventEmitterSetEnabled(true);
     dispatchAfterDetachedBlur((selectionInformation: any).focusedElem);
     ReactBrowserEventEmitterSetEnabled(false);
@@ -365,10 +365,6 @@ export function shouldSetTextContent(type: string, props: Props): boolean {
       props.dangerouslySetInnerHTML !== null &&
       props.dangerouslySetInnerHTML.__html != null)
   );
-}
-
-export function shouldDeprioritizeSubtree(type: string, props: Props): boolean {
-  return !!props.hidden;
 }
 
 export function createTextInstance(
@@ -508,15 +504,15 @@ export function insertInContainerBefore(
   }
 }
 
-function createEvent(type: TopLevelType): Event {
+function createEvent(type: TopLevelType, bubbles: boolean): Event {
   const event = document.createEvent('Event');
-  event.initEvent(((type: any): string), false, false);
+  event.initEvent(((type: any): string), bubbles, false);
   return event;
 }
 
 function dispatchBeforeDetachedBlur(target: HTMLElement): void {
-  if (enableDeprecatedFlareAPI) {
-    const event = createEvent(TOP_BEFORE_BLUR);
+  if (enableDeprecatedFlareAPI || enableCreateEventHandleAPI) {
+    const event = createEvent(TOP_BEFORE_BLUR, true);
     // Dispatch "beforeblur" directly on the target,
     // so it gets picked up by the event system and
     // can propagate through the React internal tree.
@@ -525,20 +521,14 @@ function dispatchBeforeDetachedBlur(target: HTMLElement): void {
 }
 
 function dispatchAfterDetachedBlur(target: HTMLElement): void {
-  if (enableDeprecatedFlareAPI) {
-    const event = createEvent(TOP_AFTER_BLUR);
+  if (enableDeprecatedFlareAPI || enableCreateEventHandleAPI) {
+    const event = createEvent(TOP_AFTER_BLUR, false);
     // So we know what was detached, make the relatedTarget the
     // detached target on the "afterblur" event.
     (event: any).relatedTarget = target;
     // Dispatch the event on the document.
     document.dispatchEvent(event);
   }
-}
-
-export function beforeRemoveInstance(
-  instance: Instance | TextInstance | SuspenseInstance,
-) {
-  // TODO for ReactDOM.createEventInstance
 }
 
 export function removeChild(
@@ -949,7 +939,7 @@ export function didNotFindHydratableContainerSuspenseInstance(
   parentContainer: Container,
 ) {
   if (__DEV__) {
-    // TODO: warnForInsertedHydratedSupsense(parentContainer);
+    // TODO: warnForInsertedHydratedSuspense(parentContainer);
   }
 }
 
@@ -1121,9 +1111,7 @@ export function makeOpaqueHydratingObject(
 }
 
 export function preparePortalMount(portalInstance: Instance): void {
-  if (enableModernEventSystem) {
-    listenToEvent('onMouseEnter', portalInstance);
-  }
+  listenToReactEvent('onMouseEnter', portalInstance);
 }
 
 export function prepareScopeUpdate(
@@ -1133,10 +1121,6 @@ export function prepareScopeUpdate(
   if (enableScopeAPI) {
     precacheFiberNode(internalInstanceHandle, scopeInstance);
   }
-}
-
-export function prepareScopeUnmount(scopeInstance: Object): void {
-  // TODO when we add createEventHandle
 }
 
 export function getInstanceFromScope(

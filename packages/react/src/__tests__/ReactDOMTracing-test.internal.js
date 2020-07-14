@@ -55,6 +55,19 @@ function loadModules() {
   });
 }
 
+// Note: This is based on a similar component we use in www. We can delete once
+// the extra div wrapper is no longer necessary.
+function LegacyHiddenDiv({children, mode}) {
+  return (
+    <div hidden={mode === 'hidden'}>
+      <React.unstable_LegacyHidden
+        mode={mode === 'hidden' ? 'unstable-defer-without-hiding' : mode}>
+        {children}
+      </React.unstable_LegacyHidden>
+    </div>
+  );
+}
+
 describe('ReactDOMTracing', () => {
   beforeEach(() => {
     jest.resetModules();
@@ -86,9 +99,9 @@ describe('ReactDOMTracing', () => {
             Scheduler.unstable_yieldValue('App:mount');
           }, []);
           return (
-            <div hidden={true}>
+            <LegacyHiddenDiv mode="hidden">
               <Child />
-            </div>
+            </LegacyHiddenDiv>
           );
         };
 
@@ -157,9 +170,9 @@ describe('ReactDOMTracing', () => {
             Scheduler.unstable_yieldValue('App:mount');
           }, []);
           return (
-            <div hidden={true}>
+            <LegacyHiddenDiv mode="hidden">
               <Child />
-            </div>
+            </LegacyHiddenDiv>
           );
         };
 
@@ -219,9 +232,14 @@ describe('ReactDOMTracing', () => {
               Scheduler.unstable_yieldValue('Child:update');
             } else {
               Scheduler.unstable_yieldValue('Child:mount');
-              Scheduler.unstable_runWithPriority(
+              // TODO: Double wrapping is temporary while we remove Scheduler runWithPriority.
+              ReactDOM.unstable_runWithPriority(
                 Scheduler.unstable_IdlePriority,
-                () => setDidMount(true),
+                () =>
+                  Scheduler.unstable_runWithPriority(
+                    Scheduler.unstable_IdlePriority,
+                    () => setDidMount(true),
+                  ),
               );
             }
           }, [didMount]);
@@ -234,9 +252,9 @@ describe('ReactDOMTracing', () => {
             Scheduler.unstable_yieldValue('App:mount');
           }, []);
           return (
-            <div hidden={true}>
+            <LegacyHiddenDiv mode="hidden">
               <Child />
-            </div>
+            </LegacyHiddenDiv>
           );
         };
 
@@ -304,9 +322,9 @@ describe('ReactDOMTracing', () => {
         const WithHiddenWork = () => {
           Scheduler.unstable_yieldValue('WithHiddenWork');
           return (
-            <div hidden={true}>
+            <LegacyHiddenDiv mode="hidden">
               <Child />
-            </div>
+            </LegacyHiddenDiv>
           );
         };
 
@@ -411,9 +429,9 @@ describe('ReactDOMTracing', () => {
             Scheduler.unstable_yieldValue('MaybeHiddenWork:effect');
           });
           return flag ? (
-            <div hidden={true}>
+            <LegacyHiddenDiv mode="hidden">
               <Child />
-            </div>
+            </LegacyHiddenDiv>
           ) : null;
         };
 

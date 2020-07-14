@@ -1,5 +1,4 @@
 let React;
-let ReactFeatureFlags;
 let Fragment;
 let ReactNoop;
 let Scheduler;
@@ -14,7 +13,6 @@ describe('ReactSuspenseWithNoopRenderer', () => {
   beforeEach(() => {
     jest.resetModules();
 
-    ReactFeatureFlags = require('shared/ReactFeatureFlags');
     React = require('react');
     Fragment = React.Fragment;
     ReactNoop = require('react-noop-renderer');
@@ -140,6 +138,19 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       }
       throw promise;
     }
+  }
+
+  // Note: This is based on a similar component we use in www. We can delete
+  // once the extra div wrapper is no longer necessary.
+  function LegacyHiddenDiv({children, mode}) {
+    return (
+      <div hidden={mode === 'hidden'}>
+        <React.unstable_LegacyHidden
+          mode={mode === 'hidden' ? 'unstable-defer-without-hiding' : mode}>
+          {children}
+        </React.unstable_LegacyHidden>
+      </div>
+    );
   }
 
   it('does not restart rendering for initial render', async () => {
@@ -608,28 +619,23 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       root.render(<App step={4} shouldSuspend={false} />);
     });
 
-    expect(Scheduler).toHaveYielded(
-      gate(flags =>
-        flags.new
-          ? [
-              // The new reconciler batches everything together, so it finishes
-              // without suspending again.
-              'Sibling',
-              'Step 4',
-            ]
-          : [
-              // The old reconciler tries at each distinct level.
-              'Sibling',
-              'Suspend! [Step 1]',
-              'Sibling',
-              'Suspend! [Step 2]',
-              'Sibling',
-              'Suspend! [Step 3]',
-              'Sibling',
-              'Step 4',
-            ],
-      ),
-    );
+    expect(Scheduler).toHaveYielded([
+      // The new reconciler batches everything together, so it finishes without
+      // suspending again.
+      'Sibling',
+
+      // NOTE: The final of the update got pushed into a lower priority range of
+      // lanes, leading to the extra intermediate render. This is because when
+      // we schedule the fourth update, we're already in the middle of rendering
+      // the three others. Since there are only three lanes in the default
+      // range, the fourth lane is shifted to slightly lower priority. This
+      // could easily change when we tweak our batching heuristics. Ideally,
+      // they'd all have default priority and render in a single batch.
+      'Suspend! [Step 3]',
+      'Sibling',
+
+      'Step 4',
+    ]);
   });
 
   it('forces an expiration after an update times out', async () => {
@@ -1343,28 +1349,12 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
       ReactNoop.renderLegacySyncRoot(<Demo />);
 
-      expect(Scheduler).toHaveYielded(
-        gate(flags =>
-          flags.new
-            ? [
-                'Suspend! [Hi]',
-                'Loading...',
-                // Re-render due to lifecycle update
-                'Loading...',
-              ]
-            : [
-                'Suspend! [Hi]',
-                'Loading...',
-                // Re-render due to lifecycle update
-                // Note: Old reconciler has an issue where the primary fragment
-                // fiber isn't marked during setState, so as a compromise we
-                // sometimes over-render the primary child even when it hasn't
-                // been updated.
-                'Suspend! [Hi]',
-                'Loading...',
-              ],
-        ),
-      );
+      expect(Scheduler).toHaveYielded([
+        'Suspend! [Hi]',
+        'Loading...',
+        // Re-render due to lifecycle update
+        'Loading...',
+      ]);
       expect(ReactNoop.getChildren()).toEqual([span('Loading...')]);
       await advanceTimers(100);
       expect(Scheduler).toHaveYielded(['Promise resolved [Hi]']);
@@ -1718,26 +1708,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     expect(Scheduler).toHaveYielded(['Promise resolved [B]']);
 
-    if (
-      ReactFeatureFlags.deferPassiveEffectCleanupDuringUnmount &&
-      ReactFeatureFlags.runAllPassiveEffectDestroysBeforeCreates
-    ) {
-      expect(Scheduler).toFlushAndYield([
-        'B',
-        'Destroy Layout Effect [Loading...]',
-        'Layout Effect [B]',
-        'Destroy Effect [Loading...]',
-        'Effect [B]',
-      ]);
-    } else {
-      expect(Scheduler).toFlushAndYield([
-        'B',
-        'Destroy Layout Effect [Loading...]',
-        'Destroy Effect [Loading...]',
-        'Layout Effect [B]',
-        'Effect [B]',
-      ]);
-    }
+    expect(Scheduler).toFlushAndYield([
+      'B',
+      'Destroy Layout Effect [Loading...]',
+      'Layout Effect [B]',
+      'Destroy Effect [Loading...]',
+      'Effect [B]',
+    ]);
 
     // Update
     ReactNoop.renderLegacySyncRoot(<App text="B2" />, () =>
@@ -1767,30 +1744,15 @@ describe('ReactSuspenseWithNoopRenderer', () => {
 
     expect(Scheduler).toHaveYielded(['Promise resolved [B2]']);
 
-    if (
-      ReactFeatureFlags.deferPassiveEffectCleanupDuringUnmount &&
-      ReactFeatureFlags.runAllPassiveEffectDestroysBeforeCreates
-    ) {
-      expect(Scheduler).toFlushAndYield([
-        'B2',
-        'Destroy Layout Effect [Loading...]',
-        'Destroy Layout Effect [B]',
-        'Layout Effect [B2]',
-        'Destroy Effect [Loading...]',
-        'Destroy Effect [B]',
-        'Effect [B2]',
-      ]);
-    } else {
-      expect(Scheduler).toFlushAndYield([
-        'B2',
-        'Destroy Layout Effect [Loading...]',
-        'Destroy Effect [Loading...]',
-        'Destroy Layout Effect [B]',
-        'Layout Effect [B2]',
-        'Destroy Effect [B]',
-        'Effect [B2]',
-      ]);
-    }
+    expect(Scheduler).toFlushAndYield([
+      'B2',
+      'Destroy Layout Effect [Loading...]',
+      'Destroy Layout Effect [B]',
+      'Layout Effect [B2]',
+      'Destroy Effect [Loading...]',
+      'Destroy Effect [B]',
+      'Effect [B2]',
+    ]);
   });
 
   it('suspends for longer if something took a long (CPU bound) time to render', async () => {
@@ -2886,7 +2848,14 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       foo.setState({suspend: false});
     });
 
-    expect(Scheduler).toHaveYielded(['Foo']);
+    expect(Scheduler).toHaveYielded([
+      // First setState
+      'Foo',
+      // Second setState. This update was scheduled while we were in the
+      // middle of rendering the previous update, so it was pushed to a separate
+      // batch to avoid invalidating the work-in-progress tree.
+      'Foo',
+    ]);
     expect(root).toMatchRenderedOutput(<span prop="Foo" />);
   });
 
@@ -2902,9 +2871,9 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       });
       return (
         <>
-          <div hidden={true}>
+          <LegacyHiddenDiv mode="hidden">
             <Offscreen />
-          </div>
+          </LegacyHiddenDiv>
           <Suspense fallback={<Text text="Loading..." />}>
             {showContent ? <AsyncText text="A" ms={2000} /> : null}
           </Suspense>
@@ -2957,10 +2926,10 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       });
       return (
         <Suspense fallback={<Text text="Loading..." />}>
-          <div hidden={true}>
+          <LegacyHiddenDiv mode="hidden">
             <AsyncText text="A" ms={2000} />
             <Offscreen />
-          </div>
+          </LegacyHiddenDiv>
           {showContent ? <AsyncText text="A" ms={2000} /> : null}
         </Suspense>
       );
@@ -3182,49 +3151,23 @@ describe('ReactSuspenseWithNoopRenderer', () => {
         });
         setFallbackText('Still loading...');
 
-        expect(Scheduler).toFlushAndYield(
-          gate(flags =>
-            flags.new
-              ? [
-                  // First try to render the high pri update. Still suspended.
-                  'Suspend! [C]',
-                  'Loading...',
+        expect(Scheduler).toFlushAndYield([
+          // First try to render the high pri update. Still suspended.
+          'Suspend! [C]',
+          'Loading...',
 
-                  // In the expiration times model, once the high pri update
-                  // suspends, we can't be sure if there's additional work at a
-                  // lower priority that might unblock the tree. We do know that
-                  // there's a lower priority update *somehwere* in the entire
-                  // root, though (the update to the fallback). So we try
-                  // rendering one more time, just in case.
-                  // TODO: We shouldn't need to do this with lanes, because we
-                  // always know exactly which lanes have pending work in
-                  // each tree.
-                  'Suspend! [C]',
+          // In the expiration times model, once the high pri update suspends,
+          // we can't be sure if there's additional work at a lower priority
+          // that might unblock the tree. We do know that there's a lower
+          // priority update *somehwere* in the entire root, though (the update
+          // to the fallback). So we try rendering one more time, just in case.
+          // TODO: We shouldn't need to do this with lanes, because we always
+          // know exactly which lanes have pending work in each tree.
+          'Suspend! [C]',
 
-                  // Then complete the update to the fallback.
-                  'Still loading...',
-                ]
-              : [
-                  // In the old reconciler, we don't attempt to unhdie the
-                  // Suspense boundary at high priority. Instead, we bailout,
-                  // then try again at the original priority that the component
-                  // suspended. This is mostly an implementation compromise,
-                  // though there are some advantages to this behavior, because
-                  // attempt to unhide could slow down the rest of the update.
-                  //
-                  // Render that only includes the fallback, since we bailed
-                  // out on the primary tree.
-                  'Loading...',
-
-                  // Now try the suspended update again at the original
-                  // priority. It's still suspended.
-                  'Suspend! [C]',
-
-                  // Then complete the update to the fallback.
-                  'Still loading...',
-                ],
-          ),
-        );
+          // Then complete the update to the fallback.
+          'Still loading...',
+        ]);
         expect(root).toMatchRenderedOutput(
           <>
             <span hidden={true} prop="A" />
@@ -3503,30 +3446,13 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       // Only the outer part can update. The inner part should still show a
       // fallback because we haven't finished loading B yet. Otherwise, the
       // inner text would be inconsistent with the outer text.
-      expect(Scheduler).toHaveYielded(
-        gate(flags =>
-          flags.new
-            ? [
-                'Outer text: B',
-                'Outer step: 1',
-                'Suspend! [Inner text: B]',
-                'Inner step: 1',
-                'Loading...',
-              ]
-            : [
-                // In the old reconciler, we first complete the outside of the
-                // Suspense boundary, then attempt to unhide it in a separate
-                // render at the original priority at which it suspended.
-                // First render:
-                'Outer text: B',
-                'Outer step: 1',
-                'Loading...',
-                // Second render:
-                'Suspend! [Inner text: B]',
-                'Inner step: 1',
-              ],
-        ),
-      );
+      expect(Scheduler).toHaveYielded([
+        'Outer text: B',
+        'Outer step: 1',
+        'Suspend! [Inner text: B]',
+        'Inner step: 1',
+        'Loading...',
+      ]);
       expect(root).toMatchRenderedOutput(
         <>
           <span prop="Outer text: B" />
@@ -3645,23 +3571,7 @@ describe('ReactSuspenseWithNoopRenderer', () => {
       });
     });
 
-    expect(Scheduler).toHaveYielded(
-      gate(flags =>
-        flags.new
-          ? ['Outer: B1', 'Inner: B1', 'Commit Child']
-          : [
-              // In the old reconciler, we first complete the outside of the
-              // Suspense boundary, then attempt to unhide it in a separate
-              // render at the original priority at which it suspended.
-              // First render:
-              'Outer: B1',
-              'Loading...',
-              // Second render:
-              'Inner: B1',
-              'Commit Child',
-            ],
-      ),
-    );
+    expect(Scheduler).toHaveYielded(['Outer: B1', 'Inner: B1', 'Commit Child']);
     expect(root).toMatchRenderedOutput(
       <>
         <span prop="Outer: B1" />
@@ -4003,5 +3913,60 @@ describe('ReactSuspenseWithNoopRenderer', () => {
     });
     expect(Scheduler).toHaveYielded(['Promise resolved [B]', 'B']);
     expect(root).toMatchRenderedOutput(<span prop="B" />);
+  });
+
+  it('retries have lower priority than normal updates', async () => {
+    const {useState} = React;
+
+    let setText;
+    function UpdatingText() {
+      const [text, _setText] = useState('A');
+      setText = _setText;
+      return <Text text={text} />;
+    }
+
+    const root = ReactNoop.createRoot();
+    await ReactNoop.act(async () => {
+      root.render(
+        <>
+          <UpdatingText />
+          <Suspense fallback={<Text text="Loading..." />}>
+            <AsyncText text="Async" />
+          </Suspense>
+        </>,
+      );
+    });
+    expect(Scheduler).toHaveYielded(['A', 'Suspend! [Async]', 'Loading...']);
+    expect(root).toMatchRenderedOutput(
+      <>
+        <span prop="A" />
+        <span prop="Loading..." />
+      </>,
+    );
+
+    await ReactNoop.act(async () => {
+      // Resolve the promise. This will trigger a retry.
+      await resolveText('Async');
+      expect(Scheduler).toHaveYielded(['Promise resolved [Async]']);
+      // Before the retry happens, schedule a new update.
+      setText('B');
+
+      // The update should be allowed to finish before the retry is attempted.
+      expect(Scheduler).toFlushUntilNextPaint(['B']);
+      expect(root).toMatchRenderedOutput(
+        <>
+          <span prop="B" />
+          <span prop="Loading..." />
+        </>,
+      );
+    });
+    // Then do the retry.
+    expect(Scheduler).toHaveYielded(['Async']);
+    expect(root).toMatchRenderedOutput(
+      <>
+        <span prop="B" />
+        <span prop="Async" />
+      </>,
+    );
   });
 });

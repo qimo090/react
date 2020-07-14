@@ -24,16 +24,26 @@ import type {FiberRoot} from './ReactInternalTypes';
 import type {OpaqueIDType} from './ReactFiberHostConfig';
 
 import ReactSharedInternals from 'shared/ReactSharedInternals';
+import {
+  enableDebugTracing,
+  enableSchedulingProfiler,
+  enableNewReconciler,
+} from 'shared/ReactFeatureFlags';
 
-import {NoMode, BlockingMode} from './ReactTypeOfMode';
+import {NoMode, BlockingMode, DebugTracingMode} from './ReactTypeOfMode';
 import {
   NoLane,
   NoLanes,
+  InputContinuousLanePriority,
   isSubsetOfLanes,
   mergeLanes,
   removeLanes,
-  markRootExpired,
+  markRootEntangled,
   markRootMutableRead,
+  getCurrentUpdateLanePriority,
+  setCurrentUpdateLanePriority,
+  higherLanePriority,
+  DefaultLanePriority,
 } from './ReactFiberLane';
 import {readContext} from './ReactFiberNewContext.new';
 import {createDeprecatedResponderListener} from './ReactFiberDeprecatedEvents.new';
@@ -82,6 +92,8 @@ import {
   warnAboutMultipleRenderersDEV,
 } from './ReactMutableSource.new';
 import {getIsRendering} from './ReactCurrentFiber';
+import {logStateUpdateScheduled} from './DebugTracing';
+import {markStateUpdateScheduled} from './SchedulingProfiler';
 
 const {ReactCurrentDispatcher, ReactCurrentBatchConfig} = ReactSharedInternals;
 
@@ -913,9 +925,18 @@ function readFromUnsubcribedMutableSource<Source, Snapshot>(
   }
 
   if (isSafeToReadFromSource) {
-    return getSnapshot(source._source);
+    const snapshot = getSnapshot(source._source);
+    if (__DEV__) {
+      if (typeof snapshot === 'function') {
+        console.error(
+          'Mutable source should not return a function as the snapshot value. ' +
+            'Functions may close over mutable values and cause tearing.',
+        );
+      }
+    }
+    return snapshot;
   } else {
-    // This handles the special case of a mutable source being shared beween renderers.
+    // This handles the special case of a mutable source being shared between renderers.
     // In that case, if the source is mutated between the first and second renderer,
     // The second renderer don't know that it needs to reset the WIP version during unwind,
     // (because the hook only marks sources as dirty if it's written to their WIP version).
@@ -991,21 +1012,26 @@ function useMutableSource<Source, Snapshot>(
     const maybeNewVersion = getVersion(source._source);
     if (!is(version, maybeNewVersion)) {
       const maybeNewSnapshot = getSnapshot(source._source);
+      if (__DEV__) {
+        if (typeof maybeNewSnapshot === 'function') {
+          console.error(
+            'Mutable source should not return a function as the snapshot value. ' +
+              'Functions may close over mutable values and cause tearing.',
+          );
+        }
+      }
+
       if (!is(snapshot, maybeNewSnapshot)) {
         setSnapshot(maybeNewSnapshot);
 
         const suspenseConfig = requestCurrentSuspenseConfig();
         const lane = requestUpdateLane(fiber, suspenseConfig);
         markRootMutableRead(root, lane);
-
-        // If the source mutated between render and now,
-        // there may be state updates already scheduled from the old getSnapshot.
-        // Those updates should not commit without this value.
-        // There is no mechanism currently to associate these updates though,
-        // so for now we fall back to synchronously flushing all pending updates.
-        // TODO: This should entangle the lanes instead of expiring everything.
-        markRootExpired(root, root.mutableReadLanes);
       }
+      // If the source mutated between render and now,
+      // there may be state updates already scheduled from the old source.
+      // Entangle the updates so that they render in the same batch.
+      markRootEntangled(root, root.mutableReadLanes);
     }
   }, [getSnapshot, source, subscribe]);
 
@@ -1057,7 +1083,7 @@ function useMutableSource<Source, Snapshot>(
   // It's possible that the underlying source was mutated between the when the last "change" event fired,
   // and when the current render (with the new getSnapshot function) is processed.
   //
-  // In both cases, we need to throw away pending udpates (since they are no longer relevant)
+  // In both cases, we need to throw away pending updates (since they are no longer relevant)
   // and treat reading from the source as we do in the mount case.
   if (
     !is(prevGetSnapshot, getSnapshot) ||
@@ -1483,12 +1509,20 @@ function rerenderDeferredValue<T>(
 
 function startTransition(setPending, config, callback) {
   const priorityLevel = getCurrentPriorityLevel();
+  const previousLanePriority = getCurrentUpdateLanePriority();
+  setCurrentUpdateLanePriority(
+    higherLanePriority(previousLanePriority, InputContinuousLanePriority),
+  );
   runWithPriority(
     priorityLevel < UserBlockingPriority ? UserBlockingPriority : priorityLevel,
     () => {
       setPending(true);
     },
   );
+
+  // If there's no SuspenseConfig set, we'll use the DefaultLanePriority for this transition.
+  setCurrentUpdateLanePriority(DefaultLanePriority);
+
   runWithPriority(
     priorityLevel > NormalPriority ? NormalPriority : priorityLevel,
     () => {
@@ -1498,6 +1532,7 @@ function startTransition(setPending, config, callback) {
         setPending(false);
         callback();
       } finally {
+        setCurrentUpdateLanePriority(previousLanePriority);
         ReactCurrentBatchConfig.suspense = previousConfig;
       }
     },
@@ -1722,6 +1757,19 @@ function dispatchAction<S, A>(
     }
     scheduleUpdateOnFiber(fiber, lane, eventTime);
   }
+
+  if (__DEV__) {
+    if (enableDebugTracing) {
+      if (fiber.mode & DebugTracingMode) {
+        const name = getComponentName(fiber.type) || 'Unknown';
+        logStateUpdateScheduled(name, lane, action);
+      }
+    }
+  }
+
+  if (enableSchedulingProfiler) {
+    markStateUpdateScheduled(fiber, lane);
+  }
 }
 
 export const ContextOnlyDispatcher: Dispatcher = {
@@ -1742,6 +1790,8 @@ export const ContextOnlyDispatcher: Dispatcher = {
   useTransition: throwInvalidHookError,
   useMutableSource: throwInvalidHookError,
   useOpaqueIdentifier: throwInvalidHookError,
+
+  unstable_isNewReconciler: enableNewReconciler,
 };
 
 const HooksDispatcherOnMount: Dispatcher = {
@@ -1762,6 +1812,8 @@ const HooksDispatcherOnMount: Dispatcher = {
   useTransition: mountTransition,
   useMutableSource: mountMutableSource,
   useOpaqueIdentifier: mountOpaqueIdentifier,
+
+  unstable_isNewReconciler: enableNewReconciler,
 };
 
 const HooksDispatcherOnUpdate: Dispatcher = {
@@ -1782,6 +1834,8 @@ const HooksDispatcherOnUpdate: Dispatcher = {
   useTransition: updateTransition,
   useMutableSource: updateMutableSource,
   useOpaqueIdentifier: updateOpaqueIdentifier,
+
+  unstable_isNewReconciler: enableNewReconciler,
 };
 
 const HooksDispatcherOnRerender: Dispatcher = {
@@ -1802,6 +1856,8 @@ const HooksDispatcherOnRerender: Dispatcher = {
   useTransition: rerenderTransition,
   useMutableSource: updateMutableSource,
   useOpaqueIdentifier: rerenderOpaqueIdentifier,
+
+  unstable_isNewReconciler: enableNewReconciler,
 };
 
 let HooksDispatcherOnMountInDEV: Dispatcher | null = null;
@@ -1964,6 +2020,8 @@ if (__DEV__) {
       mountHookTypesDev();
       return mountOpaqueIdentifier();
     },
+
+    unstable_isNewReconciler: enableNewReconciler,
   };
 
   HooksDispatcherOnMountWithHookTypesInDEV = {
@@ -2094,6 +2152,8 @@ if (__DEV__) {
       updateHookTypesDev();
       return mountOpaqueIdentifier();
     },
+
+    unstable_isNewReconciler: enableNewReconciler,
   };
 
   HooksDispatcherOnUpdateInDEV = {
@@ -2224,6 +2284,8 @@ if (__DEV__) {
       updateHookTypesDev();
       return updateOpaqueIdentifier();
     },
+
+    unstable_isNewReconciler: enableNewReconciler,
   };
 
   HooksDispatcherOnRerenderInDEV = {
@@ -2355,6 +2417,8 @@ if (__DEV__) {
       updateHookTypesDev();
       return rerenderOpaqueIdentifier();
     },
+
+    unstable_isNewReconciler: enableNewReconciler,
   };
 
   InvalidNestedHooksDispatcherOnMountInDEV = {
@@ -2501,6 +2565,8 @@ if (__DEV__) {
       mountHookTypesDev();
       return mountOpaqueIdentifier();
     },
+
+    unstable_isNewReconciler: enableNewReconciler,
   };
 
   InvalidNestedHooksDispatcherOnUpdateInDEV = {
@@ -2647,6 +2713,8 @@ if (__DEV__) {
       updateHookTypesDev();
       return updateOpaqueIdentifier();
     },
+
+    unstable_isNewReconciler: enableNewReconciler,
   };
 
   InvalidNestedHooksDispatcherOnRerenderInDEV = {
@@ -2794,5 +2862,7 @@ if (__DEV__) {
       updateHookTypesDev();
       return rerenderOpaqueIdentifier();
     },
+
+    unstable_isNewReconciler: enableNewReconciler,
   };
 }

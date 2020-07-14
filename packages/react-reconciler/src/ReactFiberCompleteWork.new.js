@@ -58,7 +58,7 @@ import {
   OffscreenComponent,
   LegacyHiddenComponent,
 } from './ReactWorkTags';
-import {NoMode, BlockingMode} from './ReactTypeOfMode';
+import {NoMode, BlockingMode, ProfileMode} from './ReactTypeOfMode';
 import {
   Ref,
   Update,
@@ -128,6 +128,7 @@ import {
   enableFundamentalAPI,
   enableScopeAPI,
   enableBlocksAPI,
+  enableProfilerTimer,
 } from 'shared/ReactFeatureFlags';
 import {
   markSpawnedWork,
@@ -141,6 +142,7 @@ import {OffscreenLane} from './ReactFiberLane';
 import {resetChildFibers} from './ReactChildFiber.new';
 import {updateDeprecatedEventListeners} from './ReactFiberDeprecatedEvents.new';
 import {createScopeInstance} from './ReactFiberScope.new';
+import {transferActualDuration} from './ReactProfilerTimer.new';
 
 function markUpdate(workInProgress: Fiber) {
   // Tag the fiber with an update effect. This turns a Placement into
@@ -890,6 +892,12 @@ function completeWork(
         // Something suspended. Re-render with the fallback children.
         workInProgress.lanes = renderLanes;
         // Do not reset the effect list.
+        if (
+          enableProfilerTimer &&
+          (workInProgress.mode & ProfileMode) !== NoMode
+        ) {
+          transferActualDuration(workInProgress);
+        }
         return workInProgress;
       }
 
@@ -1098,7 +1106,8 @@ function completeWork(
             if (
               renderState.tail === null &&
               renderState.tailMode === 'hidden' &&
-              !renderedTail.alternate
+              !renderedTail.alternate &&
+              !getIsHydrating() // We don't cut it if we're hydrating.
             ) {
               // We need to delete the row we just rendered.
               // Reset the effect list to what it was before we rendered this
@@ -1307,7 +1316,10 @@ function completeWork(
 
         const prevIsHidden = prevState !== null;
         const nextIsHidden = nextState !== null;
-        if (prevIsHidden !== nextIsHidden) {
+        if (
+          prevIsHidden !== nextIsHidden &&
+          newProps.mode !== 'unstable-defer-without-hiding'
+        ) {
           workInProgress.effectTag |= Update;
         }
       }
